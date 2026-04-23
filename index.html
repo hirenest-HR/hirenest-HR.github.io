@@ -734,7 +734,7 @@ function renderTalent(list) {
       </div>
       <div class="cbio">${h(c.bio)}</div>
       <div class="clinks">
-        ${c.cvUrl      ? `<a href="${h(c.cvUrl)}" target="_blank" class="clink">📎 Download CV</a>` : ''}
+        ${(c.cvBase64||c.cvUrl) ? `<a href="${h(c.cvBase64||c.cvUrl)}" download="${h(c.cvFileName||'CV.pdf')}" class="clink">📎 Download CV</a>` : ''}
         ${c.linkedin   ? `<a href="${h(c.linkedin)}" target="_blank" class="clink li">in LinkedIn</a>` : ''}
         ${c.portfolio  ? `<a href="${h(c.portfolio)}" target="_blank" class="clink li">🔗 Portfolio</a>` : ''}
       </div>
@@ -751,46 +751,94 @@ function filterTalent() {
 }
 
 /* ══════════════════════════════════════
-   SUBMIT CV
+   SUBMIT CV  (base64 approach — no CORS/Storage needed)
 ══════════════════════════════════════ */
+function setCVStatus(msg, type) {
+  let box = document.getElementById('cv-status');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'cv-status';
+    box.style.cssText = 'margin-top:1rem;padding:13px 16px;border-radius:10px;font-size:.87rem;font-weight:500;line-height:1.55';
+    document.getElementById('cv-btn').insertAdjacentElement('afterend', box);
+  }
+  const colors = {
+    err: ['rgba(184,50,50,.09)','#B83232','rgba(184,50,50,.22)'],
+    ok:  ['rgba(27,77,53,.09)','#1B4D35','rgba(27,77,53,.22)'],
+    '': ['rgba(27,58,45,.05)','var(--muted)','var(--border)']
+  };
+  const [bg,col,brd] = colors[type]||colors[''];
+  Object.assign(box.style,{display:msg?'block':'none',background:bg,color:col,border:`1px solid ${brd}`});
+  box.innerHTML = msg;
+}
+
 async function submitCV(e) {
   e.preventDefault();
   const btn  = document.getElementById('cv-btn');
   const form = e.target;
   const file = document.getElementById('cv-file').files[0];
-  if (!file) { toast('Please upload your CV file.','err'); return; }
-  if (file.size > 5 * 1024 * 1024) { toast('File too large. Max 5 MB.','err'); return; }
+  if (!file) { setCVStatus('⚠️ Please select your CV file first.','err'); return; }
+  if (file.size > 2 * 1024 * 1024) { setCVStatus('⚠️ File too large — please use a file under 2 MB (compress your PDF if needed).','err'); return; }
 
   btn.disabled = true; btn.textContent = 'Uploading…';
-  fb(async () => {
-    try {
-      const {collection,addDoc,serverTimestamp,ref,uploadBytes,getDownloadURL} = window._fb;
-      const path = `cvs/${Date.now()}_${file.name.replace(/[^\w.]/g,'_')}`;
-      const sRef = ref(window._stor, path);
-      await uploadBytes(sRef, file);
-      const cvUrl = await getDownloadURL(sRef);
-      await addDoc(collection(window._db,'candidates'), {
-        name:       form.name.value.trim(),
-        email:      form.email.value.trim(),
-        phone:      form.phone.value.trim(),
-        location:   form.location.value.trim(),
-        domain:     form.domain.value,
-        experience: form.experience.value,
-        bio:        form.bio.value.trim(),
-        linkedin:   form.linkedin.value.trim(),
-        portfolio:  form.portfolio.value.trim(),
-        cvUrl,
-        createdAt:  serverTimestamp()
-      });
-      form.reset();
-      document.getElementById('cv-fn').textContent = '';
-      toast('🎉 Profile submitted! Recruiters can now find you.','ok');
-    } catch(err) {
-      toast('Error: ' + err.message,'err');
-    } finally {
-      btn.disabled = false; btn.textContent = 'Submit My Profile ✨';
-    }
-  });
+  setCVStatus('📂 Step 1 / 3 — Reading CV file…','');
+
+  try {
+    // Read file as base64 — bypasses all CORS / Storage issues
+    const base64 = await new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload  = () => res(r.result);
+      r.onerror = () => rej(new Error('Could not read the file. Try a different file.'));
+      r.readAsDataURL(file);
+    });
+
+    setCVStatus('🔥 Step 2 / 3 — Connecting to Firebase…','');
+
+    // Wait for Firebase to be ready (max 12s)
+    await new Promise((res, rej) => {
+      if (window._fbReady) { res(); return; }
+      const t = setTimeout(() => rej(new Error('Firebase did not load in time. Please refresh the page and try again.')), 12000);
+      document.addEventListener('fb-ready', () => { clearTimeout(t); res(); }, {once:true});
+    });
+
+    setCVStatus('💾 Step 3 / 3 — Saving your profile to the database…','');
+
+    const {collection, addDoc, serverTimestamp} = window._fb;
+    await addDoc(collection(window._db, 'candidates'), {
+      name:       form.name.value.trim(),
+      email:      form.email.value.trim(),
+      phone:      form.phone.value.trim(),
+      location:   form.location.value.trim(),
+      domain:     form.domain.value,
+      experience: form.experience.value,
+      bio:        form.bio.value.trim(),
+      linkedin:   form.linkedin.value.trim(),
+      portfolio:  form.portfolio.value.trim(),
+      cvFileName: file.name,
+      cvBase64:   base64,
+      createdAt:  serverTimestamp()
+    });
+
+    form.reset();
+    document.getElementById('cv-fn').textContent = '';
+    setCVStatus('🎉 Profile submitted! You are now visible to all recruiters in the portal.','ok');
+    toast('🎉 Profile submitted successfully!','ok');
+
+  } catch(err) {
+    console.error('CV submit error:', err);
+    let msg = err.message || String(err);
+    if (msg.includes('NOT_FOUND') || msg.includes('not-found'))
+      msg = 'Firestore database not created yet!<br><b>Fix:</b> Go to <a href="https://console.firebase.google.com" target="_blank" style="color:inherit">Firebase Console</a> → Firestore Database → Create database → Start in test mode → Region: asia-south1 → Enable.';
+    else if (msg.includes('permission') || msg.includes('PERMISSION_DENIED'))
+      msg = 'Firebase rules are blocking writes.<br><b>Fix:</b> Firestore → Rules tab → set <code>allow read, write: if true;</code> → Publish.';
+    else if (msg.includes('quota') || msg.includes('resource-exhausted'))
+      msg = 'Firebase free quota reached. Wait 24 hours and try again.';
+    else if (msg.includes('network') || msg.includes('fetch'))
+      msg = 'Network error — check your internet connection and try again.';
+    setCVStatus('❌ <b>Upload failed:</b> ' + msg, 'err');
+    toast('Upload failed — see error message below.','err');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Submit My Profile ✨';
+  }
 }
 
 /* ══════════════════════════════════════
